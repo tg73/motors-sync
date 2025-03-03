@@ -14,6 +14,13 @@ MOTOR_STALL_TIME = 0.100        # Minimum wait time to enable motor pin
 LEVELING_KINEMATICS = (         # Kinematics with interconnected axes
     ['corexy', 'limited_corexy'])
 
+# Kinematics combining corexy with cartesian Y
+# --------------------------------------------
+# At present, the corexy motors are assumed to be defined as the x axis (steppers x and x1),
+# and the cartesian Y motors are assumed to be defined as the y axis (steppers y and y1).
+HYBRID_COREXY_CARTESIAN_Y_KINEMATICS = (
+    ['ratos_hybrid_corexy'])
+
 MATH_MODELS = {
     "polynomial": lambda fx, coeffs:
         max(np.roots([*coeffs[:-1], coeffs[-1] - fx]).real),
@@ -28,6 +35,22 @@ MATH_MODELS = {
     "enc_auto": lambda fx, coeffs: (fx / 1e3 / coeffs[0])
 }
 
+class DummyGcodeCommand:
+    def __init__(self, params):
+        self.params = params  # Dictionary of parameters
+
+    def get_float(self, key, default=None, above=None):
+        # Return the float value for a key, if present
+        if key in self.params:
+            return float(self.params[key])
+        return default
+
+    def get_int(self, key, default=None, above=None):
+        # Return the integer value for a key, if present
+        if key in self.params:
+            return int(self.params[key])
+        return default
+    
 class AccelHelper:
     AXES_LEVEL_DELTA = 2000
     ACCEL_FILTER_THRESHOLD = 3000
@@ -269,9 +292,10 @@ class EncoderHelper:
 
 class MotionAxis:
     VALID_MSTEPS = [256, 128, 64, 32, 16, 8, 0]
-    def __init__(self, sync, name, jx):
+    def __init__(self, sync, name, jx, display_name=None, swap_steppers=False):
         self.sync = sync
         self.name = name
+        self.display_name = display_name or name
         self.joint_axes = jx.get(name, [])
         self.config = sync.config
         self.printer = self.config.get_printer()
@@ -286,6 +310,8 @@ class MotionAxis:
         self.new_magnitude = 0.
         self.curr_retry = 0
         self.is_finished = False
+        self.swap_steppers_on_init = swap_steppers
+        self.toolhead_measure_position = None
         self.log = []
         stepper = 'stepper_' + name
         st_section = self.config.getsection(stepper)
@@ -293,6 +319,7 @@ class MotionAxis:
         max_pos = st_section.getfloat('position_max')
         self.rd = st_section.getfloat('rotation_distance')
         fspr = st_section.getint('full_steps_per_rotation', 200)
+        # (min with margin, max with margin, mid)
         self.limits = (min_pos + 10, max_pos - 10, (min_pos + max_pos) / 2)
         self.do_buzz = True
         self.rel_buzz_d = self.rd / fspr * 5
@@ -385,6 +412,9 @@ class MotionAxis:
                     f'motors_sync: Invalid microsteps count, cannot be '
                     f'more than steppers, {self.microsteps} vs {st_msteps}')
         self.steppers = belt_steppers
+        
+        if self.swap_steppers_on_init:
+            self.swap_steppers()
 
     def _init_steps_models(self, def_model):
         # todo: rewrite all func logic
@@ -546,6 +576,13 @@ class MotorsSync:
         self.printer.register_event_handler("klippy:connect", self._handle_connect)
         self.status = z_tilt.ZAdjustStatus(self.printer)
         self.connect_tasks = []
+
+        printer_section = self.config.getsection('printer')
+        self.conf_kin = printer_section.get('kinematics')
+
+        # TEMP TO REMOVE - useage indicates a required config point (eg, class config, not per se config config)
+        self.hybrid = (self.conf_kin in HYBRID_COREXY_CARTESIAN_Y_KINEMATICS)
+
         # Read config
         self._init_axes()
         self._init_sync_method()
@@ -587,42 +624,58 @@ class MotorsSync:
                 f"different for a '{self.conf_kin}' kinematics")
 
     def _init_axes(self):
-        valid_axes = ['x', 'y']
-        printer_section = self.config.getsection('printer')
-        self.conf_kin = printer_section.get('kinematics')
-        if self.conf_kin in LEVELING_KINEMATICS:
-            self.do_level = True
-            axes = [a.lower() for a in self.config.getlist(
-                'axes', count=2, default=['x', 'y'])]
-            joint_ax = {'x': ['y'], 'y': ['x']}
-        elif self.conf_kin == 'cartesian':
-            self.do_level = False
-            axes = [a.lower() for a in self.config.getlist('axes')]
-            joint_ax = {}
+        if self.hybrid:
+            # Not configurable for now.
+            mx = MotionAxis(self, 'x', {})
+            my0 = MotionAxis(self, 'y', {}, display_name='Y0')
+            my1 = MotionAxis(self, 'y', {}, display_name='Y1', swap_steppers=True)
+            mx.do_buzz = False
+            my0.do_buzz = False
+            my1.do_buzz = False
+            # TODO: Allow local config to swap in case Y/Y0 are physcially swapped.
+            my0.toolhead_measure_position = [mx.limits[0], None, None]
+            my1.toolhead_measure_position = [mx.limits[1], None, None]            
+            self.motion = {'x': mx, 'y0': my0, 'y1': my1}
         else:
-            raise self.config.error(f"motors_sync: Not supported "
-                                    f"kinematics '{self.conf_kin}'")
-        if any(axis not in valid_axes for axis in axes):
-            raise self.config.error(f"motors_sync: Invalid axes "
-                                    f"parameter '{','.join(axes)}'")
-        self.motion = {ax: MotionAxis(self, ax, joint_ax) for ax in axes}
-        if self.conf_kin in LEVELING_KINEMATICS:
-            self._check_common_attr()
+            valid_axes = ['x', 'y']
+            if self.conf_kin in LEVELING_KINEMATICS:
+                self.do_level = True
+                axes = [a.lower() for a in self.config.getlist(
+                    'axes', count=2, default=['x', 'y'])]
+                joint_ax = {'x': ['y'], 'y': ['x']}
+            elif self.conf_kin == 'cartesian':
+                self.do_level = False
+                axes = [a.lower() for a in self.config.getlist('axes')]
+                joint_ax = {}
+            else:
+                raise self.config.error(f"motors_sync: Not supported "
+                                        f"kinematics '{self.conf_kin}'")
+            if any(axis not in valid_axes for axis in axes):
+                raise self.config.error(f"motors_sync: Invalid axes "
+                                        f"parameter '{','.join(axes)}'")
+            self.motion = {ax: MotionAxis(self, ax, joint_ax) for ax in axes}
+            if self.conf_kin in LEVELING_KINEMATICS:
+                self._check_common_attr()
 
     def _init_sync_method(self):
-        methods = ['sequential', 'alternately', 'synchronous', 'default']
-        self.sync_method = self.config.getchoice(
-            'sync_method', {m: m for m in methods}, 'default')
-        if self.sync_method == 'default':
-            if self.conf_kin in LEVELING_KINEMATICS:
-                self.sync_method = methods[1]
-            else:
-                self.sync_method = methods[0]
-        elif (self.sync_method in methods[1:]
-              and self.conf_kin not in LEVELING_KINEMATICS):
-            raise self.config.error(
-                f"motors_sync: Invalid sync method: {self.sync_method} "
-                f"for '{self.conf_kin}' type kinematics")
+        if self.hybrid:
+            #if self.config.get('sync_method', None):
+            #    raise self.config.error(f"motors_sync: The sync_method parameter is not supported for '{self.conf_kin}' kinematics.")
+            self.sync_method = 'sequential'
+        else:
+            methods = ['sequential', 'alternately', 'synchronous', 'default']
+            self.sync_method = self.config.getchoice(
+                'sync_method', {m: m for m in methods}, 'default')
+            if self.sync_method == 'default':
+                if self.conf_kin in LEVELING_KINEMATICS:
+                    self.sync_method = methods[1]
+                else:
+                    self.sync_method = methods[0]
+            elif (self.sync_method in methods[1:]
+                and self.conf_kin not in LEVELING_KINEMATICS):
+                raise self.config.error(
+                    f"motors_sync: Invalid sync method: {self.sync_method} "
+                    f"for '{self.conf_kin}' type kinematics")
 
     def _init_stat_manager(self):
         command = 'SYNC_MOTORS_STATS'
@@ -676,7 +729,7 @@ class MotorsSync:
                  a for n, a in self.motion.items() if n in self.axes]):
                 if not axis.actual_msteps:
                     continue
-                name = axis.name
+                name = axis.display_name
                 magnitudes, pos = zip(*axis.log)
                 msteps = axis.microsteps
                 retries = axis.curr_retry
@@ -710,6 +763,10 @@ class MotorsSync:
         axis.check_msteps += move_msteps
         self.stepper_move(mcu_stepper, dist)
 
+    def set_toolhead_max_accel(self, accel):
+        cmd = DummyGcodeCommand({'S':accel})
+        self.toolhead.cmd_M204(cmd)
+        
     def buzz(self, axis, rel_moves=25):
         # Fading oscillations by <axis>1 stepper
         mcu_stepper1 = axis.get_steppers()[1]
@@ -723,60 +780,123 @@ class MotorsSync:
                 last_abs_pos = abs_pos
                 self.stepper_move(mcu_stepper1, dist)
 
+    def buzz_toolhead(self, axis, rel_moves=25, direction='x'):
+        # Fading oscillations by toolhead X movement
+        #
+        # axis should cover the steppers used by AB. It provides the buzz distance,
+        # but is not used for movement control. The toolhead is moved in X for movement
+        # control, regardless of the specified axis.
+        #
+        # direction must be 'x' or 'y'
+        #
+        if not direction in ('x', 'y'):
+            raise self.gcode.error('Invalid direction')
+        
+        dest_index = 0 if direction == 'x' else 1
+        
+        _, orig_max_accel = self.toolhead.get_max_velocity()
+        self.set_toolhead_max_accel(self.travel_accel)        
+        try:
+            toolhead_start_pos = self.toolhead.get_position()
+            for osc in reversed(range(0, rel_moves)):
+                abs_pos = axis.rel_buzz_d * (osc / rel_moves)
+                for inv in [1, -1]:
+                    abs_pos *= inv
+                    dest = toolhead_start_pos[:]                                
+                    dest[dest_index] += abs_pos
+                    self.toolhead.move(dest, self.travel_speed)
+            self.toolhead.wait_moves()
+        finally:
+            self.set_toolhead_max_accel(orig_max_accel)
+
+    def toolhead_move(self, coord):
+        _, orig_max_accel = self.toolhead.get_max_velocity()
+        self.set_toolhead_max_accel(self.travel_accel)        
+        try:
+            self.toolhead.manual_move(coord, self.travel_speed)
+        finally:
+            self.set_toolhead_max_accel(orig_max_accel)
+
     def measure(self, axis):
         # Measure the impact
-        if axis.do_buzz:
+        if self.hybrid:
+            if axis not in (self.motion['y0'], self.motion['y1']):
+                raise self.gcode.error(f'Unexpected state in measure: {axis.name}')
+            axis.toggle_steppers(0)
+            self.toolhead.dwell(MOTOR_STALL_TIME)
+            x_axis = self.motion['x']
+            self.buzz_toolhead(x_axis, direction='y')
+            self.buzz_toolhead(x_axis, direction='x')
+            self.toolhead.dwell(MOTOR_STALL_TIME)
+        elif axis.do_buzz:
             self.buzz(axis)
+
+        original_position = None
+        if axis.toolhead_measure_position:
+            original_position = self.toolhead.get_position()
+            self.toolhead_move(axis.toolhead_measure_position)
+            self.toolhead.dwell(MOTOR_STALL_TIME)
+
         axis.chip_helper.flush_data()
         axis.toggle_main_stepper(1, (PIN_MIN_TIME,))
         axis.toggle_main_stepper(0, (PIN_MIN_TIME,))
         axis.chip_helper.update_start_time()
         axis.toggle_main_stepper(1)
         axis.chip_helper.update_end_time()
-        if axis.do_buzz:
+        if self.hybrid:
+            axis.toggle_steppers(0)
+            self.toolhead.dwell(MOTOR_STALL_TIME)
+        elif axis.do_buzz:
             self.buzz(axis, 5)
         else:
             axis.toggle_main_stepper(0)
+
+        if original_position:
+            self.toolhead_move(original_position)
+            self.toolhead.dwell(MOTOR_STALL_TIME)
+
         return axis.calc_deviation()
 
     def homing(self):
         # Homing and going to center
         now = self.reactor.monotonic()
-        axes, confs = zip(*self.motion.items())
-        if ''.join(axes) not in self.kin.get_status(now)['homed_axes']:
-            self.gsend(f"G28 {' '.join(axes)}")
-        center_pos = ' '.join(f'{a}{c.limits[2]}' for a, c in zip(axes, confs))
+        # Get one conf for each physical axis. The axis limits should be the same for all
+        # logical axes based on the same physical axis.
+        confs = {conf.name: conf for conf in self.motion.values()}
+        if ''.join(confs.keys()) not in self.kin.get_status(now)['homed_axes']:
+            self.gsend(f"G28 {' '.join(confs.keys())}")
+        center_pos = ' '.join(f'{kvp[0]}{kvp[1].limits[2]}' for kvp in confs.items())
         self.gsend(f"G0 {center_pos} F{self.travel_speed * 60}")
         self.toolhead.dwell(MOTOR_STALL_TIME)
 
     def handle_state(self, axis, state=''):
-        name = axis.name.upper()
+        display_name = axis.display_name.upper()
         dim_type = axis.chip_helper.dim_type
         if state == 'stepped':
             msteps = axis.move_msteps * axis.move_dir[0]
-            msg = (f"{name}-New {dim_type}: {axis.new_magnitude} "
+            msg = (f"{display_name}-New {dim_type}: {axis.new_magnitude} "
                    f"on {msteps}/{axis.microsteps} step move")
         elif state == 'static':
-            msg = f"{name}-New {dim_type}: {axis.new_magnitude}"
+            msg = f"{display_name}-New {dim_type}: {axis.new_magnitude}"
         elif state == 'direction':
-            msg = f"{name}-Movement direction: {axis.move_dir[1]}"
+            msg = f"{display_name}-Movement direction: {axis.move_dir[1]}"
         elif state == 'start':
             axis.flush_motion_data()
             axis.fan_switch(False)
             axis.chip_helper.start_measurements()
             axis.init_magnitude = axis.magnitude = self.measure(axis)
-            msg = (f"{axis.name.upper()}-Initial {dim_type}: "
+            msg = (f"{display_name}-Initial {dim_type}: "
                    f"{axis.init_magnitude}")
         elif state == 'done':
             axis.fan_switch(True)
             axis.chip_helper.finish_measurements()
             axis.toggle_main_stepper(1, (PIN_MIN_TIME,)*2)
-            msg = (f"{name}-Motors adjusted by {axis.actual_msteps}/"
+            msg = (f"{display_name}-Motors adjusted by {axis.actual_msteps}/"
                    f"{axis.microsteps} step, {dim_type} "
                    f"{axis.init_magnitude} --> {axis.magnitude}")
         elif state == 'retry':
             axis.move_dir[1] = 'unknown'
-            msg = (f"{name}-Retries: {axis.curr_retry}/{axis.max_retries} "
+            msg = (f"{display_name}-Retries: {axis.curr_retry}/{axis.max_retries} "
                    f"Back on last {dim_type}: {axis.magnitude} on "
                    f"{axis.actual_msteps}/{axis.microsteps} step "
                    f"to reach {axis.retry_tolerance}")
@@ -919,19 +1039,22 @@ class MotorsSync:
                     self._single_sync(m)
         else:
             raise self.gcode.error('Error in sync methods!')
-
+    
     cmd_SYNC_MOTORS_help = 'Start motors synchronization'
     def cmd_SYNC_MOTORS(self, gcmd, force_run=False):
         # Live variables
-        axes_from_gcmd = gcmd.get('AXES', '')
-        if axes_from_gcmd:
-            axes_from_gcmd = axes_from_gcmd.split(',')
-            if any([axis not in self.motion.keys()
-                    for axis in axes_from_gcmd]):
-                raise self.gcode.error(f'Invalid axes parameter')
-            self.axes = [axis for axis in axes_from_gcmd]
+        if self.hybrid:
+            self.axes = ['y0', 'y1']
         else:
-            self.axes = list(self.motion.keys())
+            axes_from_gcmd = gcmd.get('AXES', '')
+            if axes_from_gcmd:
+                axes_from_gcmd = axes_from_gcmd.split(',')
+                if any([axis not in self.motion.keys()
+                        for axis in axes_from_gcmd]):
+                    raise self.gcode.error(f'Invalid axes parameter')
+                self.axes = [axis for axis in axes_from_gcmd]
+            else:
+                self.axes = list(self.motion.keys())
         chip = gcmd.get(f'ACCEL_CHIP', '')
         for axis in self.axes:
             m = self.motion[axis]
