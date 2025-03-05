@@ -756,7 +756,7 @@ class MotorsSync:
     def single_move(self, axis, mcu_stepper=None, dir=1):
         # Move <axis>1 stepper motor by default
         if mcu_stepper is None:
-            mcu_stepper = axis.get_steppers()[1]
+            mcu_stepper = axis.get_steppers()[0] if self.hybrid else axis.get_steppers()[1]
         move_msteps = axis.move_msteps * axis.move_dir[0] * dir
         dist = axis.move_d * move_msteps
         axis.actual_msteps += move_msteps
