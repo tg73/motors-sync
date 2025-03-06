@@ -125,11 +125,13 @@ class AccelHelper:
         end_idx = np.searchsorted(raw_data[:, 0],
                     self.aclient.request_end_time, side='right')
         t_accels = raw_data[start_idx:end_idx]
+        # TODO: REMOVE!!!
+        self.sync.save_samples(self.axis.display_name, t_accels)
         return t_accels[:, 1:]
 
     def _calc_magnitude(self):
         # Calculate impact magnitude
-        vects = self._get_accel_samples()
+        vects = self._get_accel_samples()        
         vects_len = vects.shape[0]
         # Kalman filter may distort the first values, or in some
         # cases there may be residual values of toolhead inertia.
@@ -320,7 +322,7 @@ class MotionAxis:
         self.rd = st_section.getfloat('rotation_distance')
         fspr = st_section.getint('full_steps_per_rotation', 200)
         # (min with margin, max with margin, mid)
-        self.limits = (min_pos + 10, max_pos - 10, (min_pos + max_pos) / 2)
+        self.limits = (min_pos + 20, max_pos - 20, (min_pos + max_pos) / 2)
         self.do_buzz = True
         self.rel_buzz_d = self.rd / fspr * 5
         msteps_dict = {m: m for m in self.VALID_MSTEPS}
@@ -596,6 +598,10 @@ class MotorsSync:
         self.reactor = self.printer.get_reactor()
         self._init_stat_manager()
 
+        self.save_path = os.path.expanduser(PLOT_PATH) + '/debug'
+        if not os.path.exists(self.save_path):
+            os.makedirs(self.save_path)
+
     def add_connect_task(self, task):
         self.connect_tasks.append(task)
 
@@ -633,6 +639,8 @@ class MotorsSync:
             my0.do_buzz = False
             my1.do_buzz = False
             # TODO: Allow local config to swap in case Y/Y0 are physcially swapped.
+            #my0.toolhead_measure_position = [80, None, None]
+            #my1.toolhead_measure_position = [420, None, None]            
             my0.toolhead_measure_position = [mx.limits[0], None, None]
             my1.toolhead_measure_position = [mx.limits[1], None, None]            
             self.motion = {'x': mx, 'y0': my0, 'y1': my1}
@@ -817,25 +825,31 @@ class MotorsSync:
         finally:
             self.set_toolhead_max_accel(orig_max_accel)
 
+    def save_samples(self, prefix, raw_data):
+        now = datetime.now().strftime('%Y%m%d_%H%M%S')
+        name = f"{prefix}_{now}.npy"
+        np.save(os.path.join(self.save_path, name), raw_data)
+
     def measure(self, axis):
         # Measure the impact
-        if self.hybrid:
-            if axis not in (self.motion['y0'], self.motion['y1']):
-                raise self.gcode.error(f'Unexpected state in measure: {axis.name}')
-            axis.toggle_steppers(0)
-            self.toolhead.dwell(MOTOR_STALL_TIME)
-            x_axis = self.motion['x']
-            self.buzz_toolhead(x_axis, direction='y')
-            self.buzz_toolhead(x_axis, direction='x')
-            self.toolhead.dwell(MOTOR_STALL_TIME)
-        elif axis.do_buzz:
-            self.buzz(axis)
 
         original_position = None
         if axis.toolhead_measure_position:
             original_position = self.toolhead.get_position()
             self.toolhead_move(axis.toolhead_measure_position)
             self.toolhead.dwell(MOTOR_STALL_TIME)
+
+        if self.hybrid:
+            if axis not in (self.motion['y0'], self.motion['y1']):
+                raise self.gcode.error(f'Unexpected state in measure: {axis.name}')
+            axis.toggle_steppers(0)
+            self.toolhead.dwell(MOTOR_STALL_TIME)
+            x_axis = self.motion['x']
+            #self.buzz_toolhead(x_axis, direction='y')
+            self.buzz_toolhead(x_axis, 25, direction='x')
+            #self.toolhead.dwell(0.5)
+        elif axis.do_buzz:
+            self.buzz(axis)
 
         axis.chip_helper.flush_data()
         axis.toggle_main_stepper(1, (PIN_MIN_TIME,))
@@ -844,16 +858,16 @@ class MotorsSync:
         axis.toggle_main_stepper(1)
         axis.chip_helper.update_end_time()
         if self.hybrid:
-            axis.toggle_steppers(0)
+            axis.toggle_main_stepper(0)
             self.toolhead.dwell(MOTOR_STALL_TIME)
         elif axis.do_buzz:
             self.buzz(axis, 5)
         else:
             axis.toggle_main_stepper(0)
 
-        if original_position:
-            self.toolhead_move(original_position)
-            self.toolhead.dwell(MOTOR_STALL_TIME)
+        #if original_position:
+        #    self.toolhead_move(original_position)
+        #    self.toolhead.dwell(MOTOR_STALL_TIME)
 
         return axis.calc_deviation()
 
