@@ -7,6 +7,9 @@ import os, logging, time, itertools
 from datetime import datetime
 import numpy as np
 from . import z_tilt
+import pywt
+from scipy import signal
+from scipy import interpolate
 
 PLOT_PATH = '~/printer_data/config/adxl_results/motors_sync'
 PIN_MIN_TIME = 0.010            # Minimum wait time to enable hardware pin
@@ -65,7 +68,7 @@ class AccelHelper:
         self.aclient = None
         self.chip_filter = None
         self.init_chip_config(chip_name)
-        axis.calc_deviation = self._calc_magnitude
+        axis.calc_deviation = self._calc_magnitude_new
         axis.detect_move_dir = self._detect_move_dir
         self.gcode = self.printer.lookup_object('gcode')
         self.toolhead = self.printer.lookup_object('toolhead')
@@ -137,10 +140,14 @@ class AccelHelper:
         # cases there may be residual values of toolhead inertia.
         # It is better to take a shifted zone from zero.
         static_zone = range(vects_len // 5, vects_len // 3)
-        z_cut_zone = vects[static_zone, :]
-        z_axis = np.mean(np.abs(z_cut_zone), axis=0).argmax()
-        xy_mask = np.arange(vects.shape[1]) != z_axis
-        magnitudes = np.linalg.norm(vects[:, xy_mask], axis=1)
+        y_only = True
+        if y_only:
+            magnitudes = np.abs(vects[:, 1])
+        else:
+            z_cut_zone = vects[static_zone, :]
+            z_axis = np.mean(np.abs(z_cut_zone), axis=0).argmax()
+            xy_mask = np.arange(vects.shape[1]) != z_axis
+            magnitudes = np.linalg.norm(vects[:, xy_mask], axis=1)
         # Add median, Kalman or none filter
         magnitudes = self.chip_filter(magnitudes)
         # Calculate static noise
@@ -150,6 +157,244 @@ class AccelHelper:
         magnitude = np.around(magnitude - static, 2)
         self.axis.update_log(int(magnitude))
         return magnitude
+
+    def _wavelet_denoise(self, data, noise_data):
+        # Use suitable wavelet configuration determined experimentally.
+        wavelet = 'sym4'
+        level = 5
+        scale = 1.5
+
+        # Decompose signal data
+        coeffs = pywt.wavedec(data, wavelet, level=level)
+
+        # Decompose noise data to estimate level-dependent thresholds
+        noise_coeffs = pywt.wavedec(noise_data, wavelet, level=level)
+        level_thresholds = []
+        for k in range(1, len(noise_coeffs)):
+            # Calculate threshold for this level based on noise
+            level_std = np.std(noise_coeffs[k])
+            level_threshold = level_std * np.sqrt(2*np.log(len(noise_coeffs[k])))
+            level_thresholds.append(level_threshold)
+
+        # Apply level-specific thresholds to detail coefficients
+        coeffs_thresholded = list(coeffs)
+        for k in range(1, len(coeffs)):
+            coeffs_thresholded[k] = pywt.threshold(
+                coeffs[k], 
+                level_thresholds[k-1] * scale,  # -1 because level_thresholds doesn't include approximation
+                mode='hard'
+            )
+        
+        # Reconstruct signal
+        return pywt.waverec(coeffs_thresholded, wavelet)
+    
+    def _find_peak_magnitude(self, y, upsampling_factor=10, num_peaks=3, interpolation_window=3):
+        """
+        Efficiently estimate peak magnitude using local interpolation
+        around observed peaks. Assumes evenly spaced samples.
+        
+        Args:
+            y: array of sample values
+            upsampling_factor: number of interpolated points between samples
+            num_peaks: number of highest peaks to analyze
+            interpolation_window: Number of points on each side of peak forming interpolation window
+        """
+        # Find local peaks in original data
+        peak_indices, _ = signal.find_peaks(np.abs(y))
+        
+        if len(peak_indices) == 0:
+            return 0
+        
+        # Get top peaks efficiently using argpartition
+        peak_magnitudes = np.abs(y[peak_indices])
+        if len(peak_magnitudes) > num_peaks:
+            top_idx = np.argpartition(peak_magnitudes, -num_peaks)[-num_peaks:]
+            top_peaks = peak_indices[top_idx[np.argsort(-peak_magnitudes[top_idx])]]
+        else:
+            top_peaks = peak_indices
+        
+        max_magnitude = abs(y[top_peaks[0]])  # Initialize with highest observed
+        
+        # For each peak, interpolate a small window around it
+        
+        for peak_idx in top_peaks:
+            # Define local window
+            start_idx = max(0, peak_idx - interpolation_window)
+            end_idx = min(len(y), peak_idx + interpolation_window + 1)
+            
+            # Local amplitude data and corresponding indices
+            y_local = y[start_idx:end_idx]
+            x_local = np.arange(len(y_local))
+            
+            # High resolution points just for this window
+            x_high_res = np.linspace(0, len(y_local)-1, 
+                                    len(y_local) * upsampling_factor)
+            
+            # Cubic spline interpolation on local window
+            cs = interpolate.CubicSpline(x_local, y_local)
+            peak_magnitude = np.max(np.abs(cs(x_high_res)))
+            
+            max_magnitude = max(max_magnitude, peak_magnitude)
+        
+        return max_magnitude
+    
+    def _calc_magnitude_new(self, expected_impulse_position=0.5):
+        """
+        Args:
+            expected_impulse_position: the expected position of the impulse in the sampled data. Proportional, 0.5 is the middle.
+        """
+
+        # TODO: Generalize, support XY like _calc_magnitude
+
+        if expected_impulse_position < 0.5:
+            raise self.gcode.error('expected_impulse_position must be >= 0.5')
+
+        rawdata = self._get_accel_samples()
+
+        # y only
+        data = rawdata[:, 1]
+
+        # debias
+        data = data - np.mean(data)
+        data_len = data.shape[0]
+        end_of_noise = int(data_len * (expected_impulse_position - 0.25))        
+
+        noise_zone = range(0, end_of_noise)
+        impulse_zone = range(end_of_noise, data_len)
+
+        denoised = self._wavelet_denoise(data[impulse_zone], data[noise_zone])
+        magnitude = self._find_peak_magnitude(denoised)
+
+        magnitude = np.around(magnitude, 2)
+
+        self.axis.update_log(int(magnitude))
+
+        return magnitude
+
+    def calculate_magnitude_nr(self):
+        # TODO: Generalize, support XY like _calc_magnitude
+
+        rawdata = self._get_accel_samples()
+
+        # y only
+        data = rawdata[:, 1]
+
+        # highpass filter to remove bias and low freq drift/noise
+        b, a = signal.butter(4, 0.1, btype='high')
+        data_prefiltered = signal.filtfilt(b, a, data)
+
+        # Wavelet denoising
+        wavelet = 'db4'  # Choose wavelet type
+        level = 3        # Decomposition level
+        
+        # Perform wavelet denoising
+        coeffs = pywt.wavedec(data_prefiltered, wavelet, level=level)
+        threshold = np.std(coeffs[-1]) * np.sqrt(2*np.log(len(data_prefiltered)))
+        
+        # Apply threshold to detail coefficients
+        coeffs_thresholded = list(coeffs)
+        for i in range(1, len(coeffs)):
+            coeffs_thresholded[i] = pywt.threshold(coeffs[i], threshold, mode='soft')
+        
+        # Reconstruct signal
+        data_denoised = pywt.waverec(coeffs_thresholded, wavelet)
+
+        data_len = data_denoised.shape[0]
+        valid_zone = range(data_len // 4, (data_len // 4 ) * 3 )
+        
+        # Return avg of 5 max magnitudes
+        magnitude = np.mean(np.sort(data_denoised[valid_zone])[-5:])
+        magnitude = np.around(magnitude, 2)
+
+        self.axis.update_log(int(magnitude))
+
+        return magnitude
+    
+    def _calc_impulse_energy(self):
+        # TODO: Generalize, support XY like _calc_magnitude
+
+        rawdata = self._get_accel_samples()
+
+        # y only
+        data = rawdata[:, 1]
+
+        data_len = data.shape[0]
+        impulse_range = range(int(data_len * 0.48), int(data_len * 0.55))
+
+        data = data[impulse_range]
+
+        # First integrate acceleration to get velocity
+        velocity = np.cumsum(data - np.mean(data))
+        
+        # Use abs(velocity) rather than velocity**2 to keep numbers in a similar scale to
+        # previous calculations.
+        magnitude = np.around(np.max(np.abs(velocity)) / 5, 2)
+
+        self.axis.update_log(int(magnitude))
+
+        return magnitude
+    
+        # Kinetic energy at each point
+        #kinetic_energy = velocity**2
+        
+        # Total energy would be the maximum kinetic energy
+        # during the impulse event
+        #return (np.around(np.sqrt(np.max(kinetic_energy)),2), np.around(np.sqrt(kinetic_energy),2))
+    
+
+    def calculate_impulse_energy_nr(self):
+        # nr = noise reduction
+        # TODO: Generalize, support XY like _calc_magnitude
+
+        rawdata = self._get_accel_samples()
+
+        # y only
+        data = rawdata[:, 1]
+
+        # highpass filter to remove bias and low freq drift/noise
+        b, a = signal.butter(4, 0.1, btype='high')
+        data_prefiltered = signal.filtfilt(b, a, data)
+
+        #data = data - np.mean(data)
+
+        # Wavelet denoising
+        wavelet = 'db4'  # Choose wavelet type
+        level = 3        # Decomposition level
+        
+        # Perform wavelet denoising
+        coeffs = pywt.wavedec(data_prefiltered, wavelet, level=level)
+        threshold = np.std(coeffs[-1]) * np.sqrt(2*np.log(len(data_prefiltered)))
+        
+        # Apply threshold to detail coefficients
+        coeffs_thresholded = list(coeffs)
+        for i in range(1, len(coeffs)):
+            coeffs_thresholded[i] = pywt.threshold(coeffs[i], threshold, mode='soft')
+        
+        # Reconstruct signal
+        data_denoised = pywt.waverec(coeffs_thresholded, wavelet)
+
+        #b, a = signal.butter(4, 0.1, btype='high')
+        #data_denoised_and_filtered = signal.filtfilt(b, a, data_denoised)
+
+        # First integrate acceleration to get velocity
+        velocity = np.cumsum(data_denoised - np.mean(data_denoised))
+
+        magnitude = np.around(np.max(np.abs(velocity)), 2)
+
+        self.axis.update_log(int(magnitude))
+
+        return magnitude
+
+        # Kinetic energy at each point
+        #kinetic_energy = np.abs(velocity)
+        
+        #b, a = signal.butter(4, 0.01, btype='high')
+        #kinetic_energy_filtered = np.abs(signal.filtfilt(b, a, velocity))
+
+
+        # Total energy would be the maximum kinetic energy
+        # during the impulse event
+        #return (np.around(np.max(kinetic_energy),2), np.around(kinetic_energy,2), np.around(data_denoised,2), np.around(kinetic_energy_filtered,2))
 
     def _detect_move_dir(self):
         # Determine movement direction
@@ -584,6 +829,7 @@ class MotorsSync:
 
         # TEMP TO REMOVE - useage indicates a required config point (eg, class config, not per se config config)
         self.hybrid = (self.conf_kin in HYBRID_COREXY_CARTESIAN_Y_KINEMATICS)
+        self.next_save_samples_infix = ''
 
         # Read config
         self._init_axes()
@@ -641,8 +887,8 @@ class MotorsSync:
             # TODO: Allow local config to swap in case Y/Y0 are physcially swapped.
             #my0.toolhead_measure_position = [80, None, None]
             #my1.toolhead_measure_position = [420, None, None]            
-            my0.toolhead_measure_position = [mx.limits[0], None, None]
-            my1.toolhead_measure_position = [mx.limits[1], None, None]            
+            my0.toolhead_measure_position = [mx.limits[0], 20, None]
+            my1.toolhead_measure_position = [mx.limits[1], 20, None]            
             self.motion = {'x': mx, 'y0': my0, 'y1': my1}
         else:
             valid_axes = ['x', 'y']
@@ -775,18 +1021,32 @@ class MotorsSync:
         cmd = DummyGcodeCommand({'S':accel})
         self.toolhead.cmd_M204(cmd)
         
-    def buzz(self, axis, rel_moves=25):
+    def buzz(self, axis, rel_moves=25, disable_main_stepper=True, scale=1.0):
         # Fading oscillations by <axis>1 stepper
         mcu_stepper1 = axis.get_steppers()[1]
         last_abs_pos = 0
-        axis.toggle_main_stepper(0, (PIN_MIN_TIME,)*2)
+        if disable_main_stepper:
+            axis.toggle_main_stepper(0, (PIN_MIN_TIME,)*2)
         for osc in reversed(range(0, rel_moves)):
-            abs_pos = axis.rel_buzz_d * (osc / rel_moves)
+            abs_pos = axis.rel_buzz_d * scale * (osc / rel_moves)
             for inv in [1, -1]:
                 abs_pos *= inv
                 dist = (abs_pos - last_abs_pos)
                 last_abs_pos = abs_pos
                 self.stepper_move(mcu_stepper1, dist)
+
+    def buzz_corexy(self, axis, rel_moves=25):
+        # Fading oscillations by <axis>1 stepper
+        steppers = axis.get_steppers()
+        last_abs_pos = 0
+        for osc in reversed(range(0, rel_moves)):
+            abs_pos = axis.rel_buzz_d * 1.4 * (osc / rel_moves)
+            for inv in [1, -1]:
+                abs_pos *= inv
+                dist = (abs_pos - last_abs_pos) / 2
+                last_abs_pos = abs_pos
+                self.stepper_move(steppers[0], dist)
+                self.stepper_move(steppers[1], dist)
 
     def buzz_toolhead(self, axis, rel_moves=25, direction='x'):
         # Fading oscillations by toolhead X movement
@@ -827,10 +1087,23 @@ class MotorsSync:
 
     def save_samples(self, prefix, raw_data):
         now = datetime.now().strftime('%Y%m%d_%H%M%S')
-        name = f"{prefix}_{now}.npy"
+        name = f"{prefix}_{self.next_save_samples_infix}{now}.npy"
+        self.next_save_samples_infix = ''
         np.save(os.path.join(self.save_path, name), raw_data)
 
     def measure(self, axis):
+        return self._measure(axis)
+        results = []
+        for i in range(0,3):
+            self.next_save_samples_infix = f'{axis.actual_msteps}_{i}_'
+            results.append( self._measure(axis) )
+        m = np.around(np.mean(results),2)
+        if self.gcode:            
+            msg = f'mean={m}, sd={np.around(np.std(results),2)}'
+            self.gcode.respond_info(msg, True)
+        return m
+        
+    def _measure(self, axis):
         # Measure the impact
 
         original_position = None
@@ -845,21 +1118,45 @@ class MotorsSync:
             axis.toggle_steppers(0)
             self.toolhead.dwell(MOTOR_STALL_TIME)
             x_axis = self.motion['x']
+            self.buzz_corexy(x_axis, rel_moves=25)
+            
             #self.buzz_toolhead(x_axis, direction='y')
-            self.buzz_toolhead(x_axis, 25, direction='x')
+            #self.buzz_toolhead(x_axis, 25, direction='x')
             #self.toolhead.dwell(0.5)
         elif axis.do_buzz:
             self.buzz(axis)
 
+        # original:
         axis.chip_helper.flush_data()
+        # allow any preceding movement vibrations to quiesece
+        self.toolhead.dwell(0.25)        
         axis.toggle_main_stepper(1, (PIN_MIN_TIME,))
-        axis.toggle_main_stepper(0, (PIN_MIN_TIME,))
+        #axis.toggle_main_stepper(0, (PIN_MIN_TIME,))
+        #axis.chip_helper.update_start_time()
+        
         axis.chip_helper.update_start_time()
-        axis.toggle_main_stepper(1)
+        axis.toggle_main_stepper(0, (0.5,0.1))
+        #axis.toggle_main_stepper(1)
+        expected_impulse_position = 0.5/ 0.6
         axis.chip_helper.update_end_time()
+
+        # axis.chip_helper.flush_data()
+        
+        # # allow any preceding movement vibrations to quiesece
+        # self.toolhead.dwell(0.25)
+
+        # axis.chip_helper.update_start_time()        
+
+        # axis.toggle_main_stepper(1, (0.5, 0.1))
+        # expected_impulse_position = 0.5/0.6
+
+        # axis.chip_helper.update_end_time()
+    
+        # reduce risk of turn-off impulse appearing in accel data before end_time
+        self.toolhead.dwell(0.25)
+
         if self.hybrid:
-            axis.toggle_main_stepper(0)
-            self.toolhead.dwell(MOTOR_STALL_TIME)
+            axis.toggle_main_stepper(0)            
         elif axis.do_buzz:
             self.buzz(axis, 5)
         else:
@@ -868,8 +1165,8 @@ class MotorsSync:
         #if original_position:
         #    self.toolhead_move(original_position)
         #    self.toolhead.dwell(MOTOR_STALL_TIME)
-
-        return axis.calc_deviation()
+        
+        return axis.calc_deviation(expected_impulse_position)
 
     def homing(self):
         # Homing and going to center
