@@ -707,6 +707,9 @@ class MotionAxis:
                 self.sync.handle_state(self,
                     f"Microsteps calculation returned NaN "
                     f"for {self.name.capitalize()} axis")
+            # TODO: REMOVE!
+            if self.sync.gcode:
+                self.sync.gcode.respond_info(f'Model says {res}, scale {model_scale}', True)
             return res * model_scale
         self.model_solve = model_solve
 
@@ -1010,7 +1013,7 @@ class MotorsSync:
     def single_move(self, axis, mcu_stepper=None, dir=1):
         # Move <axis>1 stepper motor by default
         if mcu_stepper is None:
-            mcu_stepper = axis.get_steppers()[0] if self.hybrid else axis.get_steppers()[1]
+            mcu_stepper = axis.get_steppers()[0 if self.hybrid else 1]
         move_msteps = axis.move_msteps * axis.move_dir[0] * dir
         dist = axis.move_d * move_msteps
         axis.actual_msteps += move_msteps
@@ -1559,7 +1562,7 @@ class MotorsSyncCalibrate:
         max_steps = 0
         invs = [1, -1, -1, 1]
         y_samples = [-1,]
-        mcu_stepper1 = m.get_steppers()[1]
+        mcu_stepper1 = m.get_steppers()[0 if self.sync.hybrid else 1]
         # Scale calibration steps
         m.move_msteps = m.microsteps // fullstep
         emul_peak_mstep = peak_mstep * m.move_msteps
