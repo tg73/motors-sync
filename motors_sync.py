@@ -1039,14 +1039,15 @@ class MotorsSync:
                 self.stepper_move(mcu_stepper1, dist)
 
     def buzz_corexy(self, axis, rel_moves=25):
-        # Fading oscillations by <axis>1 stepper
+        # Fading oscillations by alternately moving the A and B motors of a corexy axis
+        # Used by hybrid kinematics, where corexy is motors x and x1
         steppers = axis.get_steppers()
         last_abs_pos = 0
         for osc in reversed(range(0, rel_moves)):
-            abs_pos = axis.rel_buzz_d * 1.4 * (osc / rel_moves)
+            abs_pos = axis.rel_buzz_d * (osc / rel_moves)
             for inv in [1, -1]:
                 abs_pos *= inv
-                dist = (abs_pos - last_abs_pos) / 2
+                dist = (abs_pos - last_abs_pos)
                 last_abs_pos = abs_pos
                 self.stepper_move(steppers[0], dist)
                 self.stepper_move(steppers[1], dist)
