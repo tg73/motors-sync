@@ -1044,7 +1044,7 @@ class MotorsSync:
         steppers = axis.get_steppers()
         last_abs_pos = 0
         for osc in reversed(range(0, rel_moves)):
-            abs_pos = axis.rel_buzz_d * (osc / rel_moves)
+            abs_pos = axis.rel_buzz_d * 2 * (osc / rel_moves)
             for inv in [1, -1]:
                 abs_pos *= inv
                 dist = (abs_pos - last_abs_pos)
