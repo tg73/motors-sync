@@ -1573,7 +1573,8 @@ class MotorsSyncCalibrate:
             self.gcode.respond_info(
                 f'Repeats: {r}/{repeats} Move to +-'
                 f'{emul_peak_mstep}/{m.microsteps} microstep')
-            self.sync.stepper_move(mcu_stepper1, next(looped_pos))
+            if not self.sync.hybrid:
+                self.sync.stepper_move(mcu_stepper1, next(looped_pos))
             for inv in invs:
                 m.move_dir[0] = inv
                 for _ in range(peak_mstep):
