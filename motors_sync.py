@@ -674,7 +674,7 @@ class MotionAxis:
             'exponential': {'ct': 3, 'a': 0, 'f': MATH_MODELS['exponential']},
             'enc_auto': {'ct': 1, 'a': -1, 'f': MATH_MODELS['enc_auto']},
         }
-        model = self.config.getlist(f'steps_model_{self.name}', None)
+        model = self.config.getlist(f'steps_model_{self.display_name}', None)
         if model is None:
             model = self.config.getlist('steps_model', def_model)
         model_name = model[0]
